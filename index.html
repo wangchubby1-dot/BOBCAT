@@ -253,24 +253,400 @@
       justify-content:flex-end;
     }
   </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <div class="topbar">
+        <div class="title">› _ PAIR MATRIX <span>auth sequence</span></div>
+        <div class="stats">
+          <div class="stat">TIME <b id="timeLeft">30.0</b>s</div>
+          <div class="stat">MATCHED <b id="matched">0</b>/8</div>
+          <div class="stat">MOVES <b id="moves">0</b></div>
+        </div>
+      </div>
 
+      <div class="timer" aria-label="timer bar"><div class="fill" id="timerFill"></div></div>
 
+      <div class="content">
+        <div class="grid" id="grid" role="grid" aria-label="Pair matrix grid"></div>
 
+        <div class="bottom">
+          <div class="help">
+            Controls: <b>Arrow Keys</b> move • <b>Enter/Space</b> flip • Click/Tap tile<br/>
+            Match all symbols before time runs out to authenticate.
+          </div>
 
+          <div class="btns">
+            <label class="toggle">
+              <input type="checkbox" id="soundToggle" checked />
+              Sound FX
+            </label>
+            <button id="restartBtn" type="button">Restart</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
+  <!-- Access denied / win overlay -->
+  <div class="overlay" id="overlay" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modalHead">
+        <div class="badge" id="badge">!</div>
+        <div>
+          <div class="h" id="modalTitle">ACCESS DENIED</div>
+          <div style="color:rgba(255,255,255,0.65);font-size:12px;margin-top:2px" id="modalSub">
+            Error: authentication failed.
+          </div>
+        </div>
+      </div>
+      <div class="modalBody" id="modalBody">
+        Trace: timed out during handshake. Retry the sequence.
+      </div>
+      <div class="modalActions">
+        <button id="closeBtn" type="button">Try Again</button>
+      </div>
+    </div>
+  </div>
 
+<script>
+(() => {
+  // ---- Audio (WebAudio, no files) ----
+  const AudioFX = (() => {
+    let ctx = null;
+    const getCtx = () => {
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      return ctx;
+    };
 
+    const state = { enabled: true };
 
+    function tone({freq=440, dur=0.08, type="sine", gain=0.06, sweepTo=null}) {
+      if (!state.enabled) return;
+      const ac = getCtx();
+      const t0 = ac.currentTime;
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, t0);
+      if (sweepTo) o.frequency.exponentialRampToValueAtTime(sweepTo, t0 + dur);
 
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(gain, t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
 
+      o.connect(g).connect(ac.destination);
+      o.start(t0);
+      o.stop(t0 + dur + 0.02);
+    }
 
+    function noisePop(dur=0.06, gain=0.03) {
+      if (!state.enabled) return;
+      const ac = getCtx();
+      const t0 = ac.currentTime;
+      const bufferSize = Math.floor(ac.sampleRate * dur);
+      const buffer = ac.createBuffer(1, bufferSize, ac.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i=0;i<bufferSize;i++) data[i] = (Math.random()*2-1) * (1 - i/bufferSize);
 
+      const src = ac.createBufferSource();
+      src.buffer = buffer;
 
+      const g = ac.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(gain, t0+0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
 
+      // Slightly band-limit
+      const bp = ac.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.setValueAtTime(1200, t0);
+      bp.Q.setValueAtTime(0.9, t0);
 
+      src.connect(bp).connect(g).connect(ac.destination);
+      src.start(t0);
+      src.stop(t0 + dur + 0.02);
+    }
 
+    const api = {
+      state,
+      click() { tone({freq:520, dur:0.05, type:"square", gain:0.04}); },
+      flip()  { tone({freq:420, dur:0.07, type:"triangle", gain:0.05, sweepTo:780}); },
+      match() { tone({freq:660, dur:0.08, type:"sine", gain:0.06}); tone({freq:990, dur:0.10, type:"sine", gain:0.05}); },
+      miss()  { tone({freq:220, dur:0.12, type:"sawtooth", gain:0.05, sweepTo:140}); noisePop(0.05, 0.02); },
+      win()   {
+        tone({freq:523.25, dur:0.10, type:"sine", gain:0.06});
+        tone({freq:659.25, dur:0.10, type:"sine", gain:0.06});
+        tone({freq:783.99, dur:0.14, type:"sine", gain:0.06});
+      },
+      lose()  {
+        tone({freq:330, dur:0.12, type:"sawtooth", gain:0.05, sweepTo:196});
+        tone({freq:196, dur:0.16, type:"sawtooth", gain:0.05, sweepTo:110});
+      },
+      ensureUnlocked() {
+        // Safari/iOS requires a user gesture; calling resume on interaction helps.
+        try { getCtx().resume(); } catch {}
+      }
+    };
+    return api;
+  })();
 
+  // ---- Game ----
+  const gridEl = document.getElementById("grid");
+  const matchedEl = document.getElementById("matched");
+  const movesEl = document.getElementById("moves");
+  const timeEl = document.getElementById("timeLeft");
+  const timerFill = document.getElementById("timerFill");
+  const restartBtn = document.getElementById("restartBtn");
+  const overlay = document.getElementById("overlay");
+  const closeBtn = document.getElementById("closeBtn");
+  const modalTitle = document.getElementById("modalTitle");
+  const modalSub = document.getElementById("modalSub");
+  const modalBody = document.getElementById("modalBody");
+  const badge = document.getElementById("badge");
+  const soundToggle = document.getElementById("soundToggle");
 
+  const SYMBOLS = ["⌬","⌁","⌖","⌘","⎈","⏣","⟐","⟡"]; // 8 symbols, 2 of each => 16
+  const GRID = 4;
+  const TOTAL_PAIRS = 8;
+  const ROUND_TIME = 30.0; // seconds (close to your clip vibe)
 
+  let tiles = [];
+  let cursor = 0;
+  let firstPick = null;
+  let lock = false;
+  let moves = 0;
+  let matched = 0;
 
+  let startTime = 0;
+  let raf = 0;
+  let ended = false;
 
+  function shuffle(arr){
+    for (let i=arr.length-1;i>0;i--){
+      const j = Math.floor(Math.random()*(i+1));
+      [arr[i],arr[j]]=[arr[j],arr[i]];
+    }
+    return arr;
+  }
+
+  function buildTiles(){
+    const pool = shuffle([...SYMBOLS, ...SYMBOLS]); // 16
+    tiles = pool.map((sym, idx) => ({
+      id: idx,
+      sym,
+      revealed: false,
+      matched: false
+    }));
+  }
+
+  function render(){
+    gridEl.innerHTML = "";
+    tiles.forEach((t, idx) => {
+      const btn = document.createElement("div");
+      btn.className = "tile";
+      btn.setAttribute("role", "gridcell");
+      btn.setAttribute("tabindex", "-1");
+      btn.dataset.idx = String(idx);
+
+      if (t.revealed) btn.classList.add("revealed");
+      if (t.matched) btn.classList.add("matched");
+      if (idx === cursor) btn.classList.add("cursor");
+
+      const dot = document.createElement("div");
+      dot.className = "dot";
+
+      const sym = document.createElement("div");
+      sym.className = "sym";
+      sym.textContent = t.sym;
+
+      btn.appendChild(dot);
+      btn.appendChild(sym);
+
+      btn.addEventListener("pointerdown", () => {
+        AudioFX.ensureUnlocked();
+        cursor = idx;
+        AudioFX.click();
+        syncCursorClasses();
+        flipAt(idx);
+      });
+
+      gridEl.appendChild(btn);
+    });
+
+    matchedEl.textContent = String(matched);
+    movesEl.textContent = String(moves);
+  }
+
+  function syncCursorClasses(){
+    [...gridEl.children].forEach((el, idx) => {
+      el.classList.toggle("cursor", idx === cursor);
+    });
+  }
+
+  function setOverlay(show){
+    overlay.classList.toggle("show", show);
+    overlay.setAttribute("aria-hidden", String(!show));
+  }
+
+  function endGame(win){
+    ended = true;
+    cancelAnimationFrame(raf);
+
+    if (win){
+      AudioFX.win();
+      badge.textContent = "✓";
+      badge.style.color = "var(--ok)";
+      badge.style.borderColor = "rgba(69,255,154,0.45)";
+      badge.style.background = "rgba(69,255,154,0.12)";
+      modalTitle.textContent = "ACCESS GRANTED";
+      modalSub.textContent = "Handshake complete.";
+      modalBody.innerHTML = `Status: <b>authenticated</b>.<br/>Moves: <b>${moves}</b> • Time left: <b>${timeEl.textContent}s</b>`;
+    } else {
+      AudioFX.lose();
+      badge.textContent = "!";
+      badge.style.color = "var(--danger)";
+      badge.style.borderColor = "rgba(255,93,93,0.35)";
+      badge.style.background = "rgba(255,93,93,0.12)";
+      modalTitle.textContent = "ACCESS DENIED";
+      modalSub.textContent = "Error: authentication failed.";
+      modalBody.innerHTML = `Trace: sequence incomplete.<br/>Matched: <b>${matched}/${TOTAL_PAIRS}</b> • Moves: <b>${moves}</b>`;
+    }
+    setOverlay(true);
+  }
+
+  function flipAt(idx){
+    if (ended || lock) return;
+    const t = tiles[idx];
+    if (t.matched || t.revealed) return;
+
+    // reveal
+    t.revealed = true;
+    AudioFX.flip();
+    render();
+
+    if (firstPick === null){
+      firstPick = idx;
+      return;
+    }
+
+    moves++;
+    const a = tiles[firstPick];
+    const b = tiles[idx];
+
+    if (a.sym === b.sym){
+      // match
+      a.matched = true;
+      b.matched = true;
+      matched++;
+      firstPick = null;
+      AudioFX.match();
+      render();
+      if (matched >= TOTAL_PAIRS) endGame(true);
+    } else {
+      // mismatch
+      lock = true;
+      AudioFX.miss();
+      setTimeout(() => {
+        a.revealed = false;
+        b.revealed = false;
+        firstPick = null;
+        lock = false;
+        render();
+      }, 520);
+    }
+    matchedEl.textContent = String(matched);
+    movesEl.textContent = String(moves);
+  }
+
+  function clampCursor(){
+    cursor = Math.max(0, Math.min(tiles.length - 1, cursor));
+    syncCursorClasses();
+  }
+
+  function moveCursor(dx, dy){
+    const x = cursor % GRID;
+    const y = Math.floor(cursor / GRID);
+    const nx = Math.max(0, Math.min(GRID-1, x + dx));
+    const ny = Math.max(0, Math.min(GRID-1, y + dy));
+    cursor = ny * GRID + nx;
+    AudioFX.click();
+    clampCursor();
+  }
+
+  function tick(){
+    const now = performance.now();
+    const elapsed = (now - startTime) / 1000;
+    const left = Math.max(0, ROUND_TIME - elapsed);
+
+    timeEl.textContent = left.toFixed(1);
+    timerFill.style.transform = `scaleX(${left / ROUND_TIME})`;
+
+    // Make the bar look more urgent near the end by slightly dimming
+    if (left < 6) timerFill.style.filter = "saturate(1.2) brightness(0.95)";
+    else timerFill.style.filter = "none";
+
+    if (left <= 0 && !ended){
+      endGame(false);
+      return;
+    }
+
+    raf = requestAnimationFrame(tick);
+  }
+
+  function restart(){
+    ended = false;
+    setOverlay(false);
+    moves = 0;
+    matched = 0;
+    firstPick = null;
+    lock = false;
+    cursor = 0;
+    buildTiles();
+    render();
+    startTime = performance.now();
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(tick);
+  }
+
+  // Keyboard
+  window.addEventListener("keydown", (e) => {
+    // unlock audio on first key action
+    AudioFX.ensureUnlocked();
+
+    if (overlay.classList.contains("show")){
+      if (e.key === "Enter" || e.key === " " || e.key === "Escape") {
+        e.preventDefault();
+        restart();
+      }
+      return;
+    }
+
+    const k = e.key;
+    if (k === "ArrowLeft"){ e.preventDefault(); moveCursor(-1,0); }
+    else if (k === "ArrowRight"){ e.preventDefault(); moveCursor(1,0); }
+    else if (k === "ArrowUp"){ e.preventDefault(); moveCursor(0,-1); }
+    else if (k === "ArrowDown"){ e.preventDefault(); moveCursor(0,1); }
+    else if (k === "Enter" || k === " "){
+      e.preventDefault();
+      flipAt(cursor);
+    }
+  });
+
+  // UI buttons
+  restartBtn.addEventListener("click", () => { AudioFX.ensureUnlocked(); AudioFX.click(); restart(); });
+  closeBtn.addEventListener("click", () => { AudioFX.ensureUnlocked(); AudioFX.click(); restart(); });
+
+  soundToggle.addEventListener("change", () => {
+    AudioFX.state.enabled = soundToggle.checked;
+    AudioFX.ensureUnlocked();
+    if (AudioFX.state.enabled) AudioFX.match();
+  });
+
+  // Start
+  restart();
+})();
+</script>
+</body>
+</html>
